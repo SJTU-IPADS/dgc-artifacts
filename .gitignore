@@ -1,0 +1,11 @@
+tmp_0/
+*.log
+*.pdf
+*.png
+results/
+test.txt
+*.csv
+.run.lock
+result/
+latency.txt
+*.data.gz

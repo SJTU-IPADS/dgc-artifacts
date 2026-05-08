@@ -1,0 +1,229 @@
+#!/bin/bash
+# runner-dgc.sh — Run a DGC test (Coordinator → Client → Host orchestration)
+#
+# Process startup order:
+#   1. Coordinator (optional, manages scheduling heuristic)
+#   2. DGC Clients (one per host, runs concurrent marking)
+#   3. Application JVMs (Host JVMs with SnicGCHost flag)
+#
+# For SPECjbb MULTI mode, the order is different — see workload-specjbb.sh.
+# This file handles the common DGC process management for DaCapo and HBase.
+
+source "$(dirname "${BASH_SOURCE[0]}")/cpu.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/isolation.sh"
+
+DGC_PIDS=()   # track all DGC background processes for cleanup
+
+# Start the DGC coordinator process
+# Writes PID to DGC_COOR_PID
+start_dgc_coordinator() {
+    local host_count="${1:-2}"
+    local rpc_port="$RPC_PORT"
+    local log_file="${RUN_DIR}/logs/coordinator.log"
+
+    # CP-SAT resource capacity: shared DGC core pool (all clients share the same cores)
+    local coor_total_cores=${CLIENT_CCMT:-4}
+    local coor_gc="${GC_FLAGS} ${SNIC_FLAGS} ${COOR_FLAGS} \
+        -XX:SnicGCCoorSHMPath=$(shm_path_coor) \
+        -XX:SnicShmGlobalPacerPath=$(shm_path_pacer) \
+        -XX:SnicGCCoorClientNum=${host_count} \
+        -XX:ConcGCThreads=${coor_total_cores} \
+        -XX:ParallelGCThreads=${coor_total_cores}"
+
+    # SnicCoorFrozenDGCUpperBound applies to both SHM and RDMA
+    coor_gc="${coor_gc} -XX:SnicCoorFrozenDGCUpperBound=${COOR_FROZEN_UPPER:-80}"
+
+    if [ "${DGC_TRANSPORT}" = "rdma" ]; then
+        coor_gc="${coor_gc} -XX:RDMAPortForCoor=${COOR_RDMA_PORT:-9999}"
+        coor_gc="${coor_gc} -XX:SnicGCEstimatedRDMACopyTime=${COOR_RDMA_COPY_TIME:-60}"
+        coor_gc="${coor_gc} -XX:SnicCoorHostAddrPortList="
+        coor_gc="${coor_gc} -XX:SNICAddr=${DGC_ADDR} -XX:HostAddr=${DGC_ADDR}"
+        # The dgc-rdma-evict-preset working config sets SnicAvgMarkTimeAmplifyRate=2.0
+        if [ -n "${COOR_AVG_MARK_AMPLIFY:-}" ]; then
+            coor_gc="${coor_gc} -XX:SnicAvgMarkTimeAmplifyRate=${COOR_AVG_MARK_AMPLIFY}"
+        fi
+    fi
+
+    log "Starting DGC Coordinator (host_count=${host_count})..."
+    local _coor_cmd="${JAVA} -Xlog:gc*=info:stdout:timemillis \
+        ${coor_gc} ${COMMON_FLAGS} \
+        -Xmx${HEAP_SIZE}m -Xms${HEAP_SIZE}m \
+        -jar ${BENCH_JAR} -m COMPOSITE"
+    ${JAVA} -Xlog:gc*=info:stdout:timemillis \
+        ${coor_gc} ${COMMON_FLAGS} \
+        -Xmx${HEAP_SIZE}m -Xms${HEAP_SIZE}m \
+        -jar "${BENCH_JAR}" -m COMPOSITE \
+        &> "$log_file" &
+    DGC_COOR_PID=$!
+    DGC_PIDS+=($DGC_COOR_PID)
+    log_cmd "coordinator" "$DGC_COOR_PID" "$_coor_cmd"
+    wait_ready 5
+}
+
+# Start a DGC client process
+# Args: $1=host_id
+start_dgc_client() {
+    local host_id=$1
+    local client_cores="${CLIENT_CCMT:-4}"
+    local cpu_list
+    cpu_list=$(cpu_dgc_client "$client_cores" "$host_id")
+
+    local client_rpc_port=$((RPC_PORT + host_id))
+    local rdma_port=$((${RDMA_BASE_PORT:-2340} + host_id))
+    local log_file="${RUN_DIR}/logs/dgc_client_${host_id}.log"
+    local client_log_level="${DGC_CLIENT_LOG_LEVEL:-info}"
+
+    local client_gc="${GC_FLAGS} ${CLIENT_FLAGS} ${SNIC_FLAGS} \
+        -XX:ParallelGCThreads=${client_cores} \
+        -XX:ConcGCThreads=${client_cores} \
+        -XX:RPCPort=${client_rpc_port} \
+        -XX:RDMAPort=${rdma_port} \
+        -XX:SnicGCHostNum=1 \
+        -XX:ShmClientMarkerNum=${client_cores} \
+        $(build_shm_flags_client $host_id)"
+
+    # WORKAROUND: build_shm_flags_client adds +SnicGCGlobalPacer, but the
+    # client-side global pacer code path crashes in standalone hbase rdma.
+    # The historical lht table3 cmd disables it for rdma. Force-disable here.
+    if [ "${DGC_TRANSPORT}" = "rdma" ]; then
+        client_gc="${client_gc} -XX:-SnicGCGlobalPacer"
+    fi
+    if [ "${ALWAYS_DGC:-false}" = "true" ]; then
+        # AlwaysDGC: client does NOT use coordinator heuristic
+        client_gc="${client_gc} -XX:-SnicGCCoorHeuristic"
+    else
+        client_gc="${client_gc} \
+            -XX:+SnicGCCoorHeuristic \
+            -XX:SnicGCCoorSHMPath=$(shm_path_coor) \
+            -XX:SnicGCCoorClientNum=${HOST_COUNT:-2} \
+            -XX:SnicGCCoorClientId=${host_id}"
+    fi
+
+    if [ "${DGC_TRANSPORT}" = "rdma" ]; then
+        client_gc="${client_gc} \
+            -XX:SnicSATBRootsSplitPartNum=1 \
+            -XX:SNICTransRegionGroupNum=${TRANS_REGION_GROUP:-200} \
+            -XX:SnicSATBRootsForceDeltaNum=5 \
+            -XX:DpuClientMarkerNum=${client_cores} \
+            -XX:SnicGCEstimatedRDMACopyTime=${CLIENT_RDMA_COPY_TIME:-60} \
+            -XX:SNICAddr=${DGC_ADDR} -XX:HostAddr=${DGC_ADDR}"
+        # fig7 hook: address-translated local memory pool (cache size sweep).
+        # Set CLIENT_MEM_BUDGET=N (MB) to enable; default = unset (no translation).
+        if [ -n "${CLIENT_MEM_BUDGET:-}" ]; then
+            client_gc="${client_gc} \
+                -XX:+SnicGCRegionAddressTranslation \
+                -XX:SnicGCLocalMemoryPoolMinAddress=0x1800000000 \
+                -XX:SnicGCLocalMemoryPoolSize=${CLIENT_MEM_BUDGET}"
+            # Tunable eviction params (defaults 50 / 1000 / 256). The working
+            # config uses EVICTION_CONTROL=0, EST_OBJECT_SIZE=10.
+            if [ -n "${EVICTION_CONTROL:-}" ]; then
+                client_gc="${client_gc} -XX:SnicGCEvictionHotnessControl=${EVICTION_CONTROL}"
+            fi
+            if [ -n "${EVICTION_UPDATE_THR:-}" ]; then
+                client_gc="${client_gc} -XX:SnicGCEvictionMarkedDataUpdateThreshold=${EVICTION_UPDATE_THR}"
+            fi
+            if [ -n "${EST_OBJECT_SIZE:-}" ]; then
+                client_gc="${client_gc} -XX:SnicGCEstimatedObjectSize=${EST_OBJECT_SIZE}"
+            fi
+        fi
+    fi
+
+    log "Starting DGC Client ${host_id} (cores=${cpu_list}, log=${client_log_level})..."
+    local _client_cmd="numactl -C ${cpu_list} -m${NUMA_NODE:-1} \
+        ${JAVA} -Xlog:gc*=${client_log_level}:stdout:timemillis \
+        ${client_gc} ${COMMON_FLAGS} \
+        -Xmx${HEAP_SIZE}m -Xms${HEAP_SIZE}m \
+        -jar ${BENCH_JAR} -m COMPOSITE"
+    numactl -C "$cpu_list" -m${NUMA_NODE:-1} \
+        ${JAVA} -Xlog:gc*=${client_log_level}:stdout:timemillis \
+        ${client_gc} ${COMMON_FLAGS} \
+        -Xmx${HEAP_SIZE}m -Xms${HEAP_SIZE}m \
+        -jar "${BENCH_JAR}" -m COMPOSITE \
+        &> "$log_file" &
+    local pid=$!
+    DGC_PIDS+=($pid)
+    log_cmd "dgc_client_${host_id}" "$pid" "$_client_cmd"
+}
+
+# Build host JVM flags (used by workload scripts to construct the full command)
+# Args: $1=host_id
+build_dgc_host_flags() {
+    local host_id=$1
+    local host_rpc_port=$((RPC_PORT + host_id))
+    local rdma_port=$((${RDMA_BASE_PORT:-2340} + host_id))
+
+    local host_gc="${GC_FLAGS} ${SNIC_FLAGS} ${HOST_FLAGS} \
+        -XX:ParallelGCThreads=${PCORE} \
+        -XX:ConcGCThreads=${CCMT} \
+        -XX:ShenandoahMaxSATBBufferFlushes=${HOST_SATB_FLUSHES:-5} \
+        -XX:RPCPort=${host_rpc_port} \
+        -XX:RDMAPort=${rdma_port} \
+        $(build_shm_flags_host $host_id) \
+        -XX:ShmClientMarkerNum=${CLIENT_CCMT:-4}"
+
+    # Same workaround on the host side: lht table3 ran with -SnicGCGlobalPacer.
+    if [ "${DGC_TRANSPORT}" = "rdma" ]; then
+        host_gc="${host_gc} -XX:-SnicGCGlobalPacer"
+    fi
+
+    if [ "${ALWAYS_DGC:-false}" = "true" ]; then
+        # No coordinator: host uses -SnicGCCoorHeuristic (set in HOST_FLAGS from conf)
+        host_gc="${host_gc} -XX:+DGCNoPenalty"
+    else
+        host_gc="${host_gc} \
+            -XX:SnicGCCoorClientId=${host_id} \
+            -XX:+SnicGCCoorHeuristic \
+            -XX:+DGCNoPenalty \
+            -XX:SnicCoorCCMTArgs=${COOR_CCMT_ARGS}"
+    fi
+
+    if [ "${DGC_TRANSPORT}" = "rdma" ]; then
+        host_gc="${host_gc} \
+            -XX:RDMAPortForCoor=${COOR_RDMA_PORT:-9999} \
+            -XX:+SnicGCRDMAPrefetchEnabled \
+            -XX:SnicGCEstimatedRDMACopyTime=${HOST_RDMA_COPY_TIME:-60} \
+            -XX:SnicSATBRootsSplitPartNum=1 \
+            -XX:SNICTransRegionGroupNum=${TRANS_REGION_GROUP:-200} \
+            -XX:SnicSATBRootsForceDeltaNum=5 \
+            -XX:DpuClientMarkerNum=${CLIENT_CCMT:-4} \
+            -XX:SnicGCIntervalUnderEstimation=0 \
+            -XX:SNICAddr=${DGC_ADDR} -XX:HostAddr=${DGC_ADDR}"
+    fi
+
+    echo "$host_gc"
+}
+
+# Cleanup DGC processes (coordinator + clients only).
+# Does NOT kill SPECjbb processes — the reporter needs to finish generating
+# RT curve files after the controller exits. SPECjbb leftovers are cleaned
+# at the START of the next run (in run_specjbb pre-run cleanup).
+cleanup_dgc() {
+    log "Cleaning up DGC processes..."
+    for pid in "${DGC_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    safe_pkill "SnicGCClient"
+    safe_pkill "SnicGCCoordinator"
+    sleep 2
+    for pid in "${DGC_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    cleanup_isolated
+    DGC_PIDS=()
+}
+
+# Trap cleanup on exit. Chains onto any existing EXIT trap (e.g. run.sh's
+# lock-truncate) so we don't silently drop earlier cleanup steps. Without the
+# chain, a DGC run leaves stale `<user> <pid> <ts>` holder info inside
+# $LOCK_FILE — the flock itself is kernel-released on process exit, so a
+# subsequent run.sh can still acquire the lock, but `cat $LOCK_FILE` between
+# runs misleadingly reports a long-gone holder.
+trap_dgc_cleanup() {
+    local prev_exit prev_int prev_term
+    prev_exit=$(trap -p EXIT | sed -n "s/^trap -- '\(.*\)' EXIT$/\1/p")
+    prev_int=$( trap -p INT  | sed -n "s/^trap -- '\(.*\)' INT$/\1/p")
+    prev_term=$(trap -p TERM | sed -n "s/^trap -- '\(.*\)' TERM$/\1/p")
+    trap "cleanup_dgc${prev_exit:+; $prev_exit}" EXIT
+    trap "cleanup_dgc${prev_int:+;  $prev_int}"  INT
+    trap "cleanup_dgc${prev_term:+; $prev_term}" TERM
+}
